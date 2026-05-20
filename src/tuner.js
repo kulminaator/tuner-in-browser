@@ -11,49 +11,64 @@ export const NOTE_STRINGS = [
   'F#', 'G', 'G#', 'A', 'A#', 'B',
 ];
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const MIN_FREQ = 30;        // Hz — lowest note we care about
+const MAX_FREQ = 2000;      // Hz — highest note we care about
+const YIN_THRESHOLD = 0.14; // CMND dip threshold
+const RMS_GATE_YIN = 0.005; // minimum RMS for YIN detection
+const RMS_GATE_AC = 0.01;   // minimum RMS for autocorrelation
+
+// ── Utility helpers ──────────────────────────────────────────────────────────
+
+function computeRms(buffer) {
+  let sum = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    sum += buffer[i] * buffer[i];
+  }
+  return Math.sqrt(sum / buffer.length);
+}
+
 // ── YIN-inspired pitch detection ─────────────────────────────────────────────
 
-const MIN_FREQ = 30;       // Hz — lowest note we care about
-const MAX_FREQ = 2000;     // Hz — highest note we care about
-
 /**
- * YIN-inspired pitch detection, robust against harmonics and noise.
- *
- * Steps:
- *  1. Compute the difference function, normalised by (N−τ) to remove the
- *     edge-effect bias that would otherwise pull low-frequency estimates
- *     sharp.
- *  2. Cumulative mean-normalised difference (CMND) for a reliable threshold.
- *  3. Find the true minimum inside the first dip below threshold.
- *  4. Parabolic interpolation for sub-sample precision.
- *  5. Harmonic consistency check: verify the fundamental's harmonics are
- *     present so we don't confuse a harmonic for the fundamental.
- *
- * @param {Float32Array|number[]} buffer - Audio samples in [-1, 1]
- * @param {number} sampleRate - Samples per second
- * @returns {number} Detected frequency in Hz, or -1 if no signal
+ * Orchestrates the YIN pipeline:
+ *   RMS gate → difference function → CMND → dip search →
+ *   parabolic interpolation → harmonic consistency fallback.
  */
 export function detectPitch(buffer, sampleRate) {
-  const SIZE = buffer.length;
-  const MAX_LAG = Math.floor(sampleRate / MIN_FREQ);
-  const MIN_LAG = Math.floor(sampleRate / MAX_FREQ);
+  const maxLag = Math.floor(sampleRate / MIN_FREQ);
+  const minLag = Math.floor(sampleRate / MAX_FREQ);
 
-  // --- RMS gate ---
-  let rms = 0;
-  for (let i = 0; i < SIZE; i++) {
-    rms += buffer[i] * buffer[i];
+  if (computeRms(buffer) < RMS_GATE_YIN) return -1;
+
+  const maxTau = Math.min(maxLag, Math.floor(buffer.length / 2));
+  const diffFunc = computeDifferenceFunction(buffer, maxTau);
+  const cmnd = computeCMND(diffFunc);
+
+  const dipStart = findFirstDipStart(cmnd, minLag, maxTau);
+  if (dipStart === -1) return -1;
+
+  const bestTau = findDipMinimum(cmnd, dipStart, maxTau);
+  const bestLag = interpolateParabolically(cmnd, bestTau, maxTau);
+
+  const frequency = sampleRate / bestLag;
+
+  if (!isHarmonicallyConsistent(cmnd, bestLag, minLag, maxTau)) {
+    return tryHarmonicFallback(cmnd, bestLag, sampleRate, minLag, maxTau);
   }
-  rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.005) return -1;
 
-  // --- Difference function (normalised by N−τ) ---
-  // Without this normalisation the raw sum naturally decreases at larger τ
-  // simply because fewer pairs are summed, creating a downward slope that
-  // biases the detected lag short (frequency sharp) — especially at low
-  // frequencies where τ is large.
-  const maxTau = Math.min(MAX_LAG, Math.floor(SIZE / 2));
+  return frequency;
+}
+
+/**
+ * Difference function normalised by (N−τ) to remove the edge-effect bias
+ * that would otherwise pull low-frequency estimates sharp.
+ */
+function computeDifferenceFunction(buffer, maxTau) {
   const d = new Float32Array(maxTau + 1);
   d[0] = 0;
+  const SIZE = buffer.length;
 
   for (let tau = 1; tau <= maxTau; tau++) {
     let diff = 0;
@@ -62,165 +77,166 @@ export function detectPitch(buffer, sampleRate) {
       const delta = buffer[i] - buffer[i + tau];
       diff += delta * delta;
     }
-    d[tau] = diff / terms;  // ← key fix: normalise by number of terms
+    d[tau] = diff / terms;
   }
 
-  // --- Cumulative mean-normalised difference (CMND) ---
-  const cmnd = new Float32Array(maxTau + 1);
+  return d;
+}
+
+/**
+ * Cumulative mean-normalised difference for a reliable threshold.
+ */
+function computeCMND(diffFunc) {
+  const cmnd = new Float32Array(diffFunc.length);
   cmnd[0] = 1;
   let cumSum = 0;
-  for (let tau = 1; tau <= maxTau; tau++) {
-    cumSum += d[tau];
-    cmnd[tau] = d[tau] * tau / cumSum;
+
+  for (let tau = 1; tau < diffFunc.length; tau++) {
+    cumSum += diffFunc[tau];
+    cmnd[tau] = diffFunc[tau] * tau / cumSum;
   }
 
-  // --- Find the true minimum inside the first dip below threshold ---
-  const THRESHOLD = 0.14;
-  let dipStart = -1;
-  for (let tau = MIN_LAG; tau < maxTau; tau++) {
-    if (cmnd[tau] < THRESHOLD) {
-      dipStart = tau;
-      break;
-    }
+  return cmnd;
+}
+
+/**
+ * Find the first lag where CMND drops below the threshold.
+ */
+function findFirstDipStart(cmnd, minLag, maxTau) {
+  for (let tau = minLag; tau < maxTau; tau++) {
+    if (cmnd[tau] < YIN_THRESHOLD) return tau;
   }
+  return -1;
+}
 
-  if (dipStart === -1) return -1;
-
-  // Scan the whole dip and track the actual minimum
+/**
+ * Scan the dip and return the lag with the deepest minimum.
+ */
+function findDipMinimum(cmnd, dipStart, maxTau) {
   let bestTau = dipStart;
   let bestVal = cmnd[dipStart];
+
   for (let tau = dipStart + 1; tau < maxTau; tau++) {
-    if (cmnd[tau] >= THRESHOLD) break;  // exited the dip
+    if (cmnd[tau] >= YIN_THRESHOLD) break;
     if (cmnd[tau] < bestVal) {
       bestVal = cmnd[tau];
       bestTau = tau;
     }
   }
 
-  // --- Parabolic interpolation for sub-sample precision ---
-  let bestLag = bestTau;
-  if (bestTau > 0 && bestTau < maxTau - 1) {
-    const x0 = cmnd[bestTau - 1];
-    const x1 = cmnd[bestTau];
-    const x2 = cmnd[bestTau + 1];
-    const denom = x0 - 2 * x1 + x2;
-    if (denom !== 0) {
-      const p = 0.5 * (x0 - x2) / denom;
-      // Clamp to ±0.5 so we don't overshoot to a neighbouring period
-      bestLag = bestTau + Math.max(-0.5, Math.min(0.5, p));
-    }
-  }
+  return bestTau;
+}
 
-  const frequency = sampleRate / bestLag;
+/**
+ * Parabolic interpolation for sub-sample precision (clamped to ±0.5).
+ */
+function interpolateParabolically(cmnd, bestTau, maxTau) {
+  if (bestTau <= 0 || bestTau >= maxTau - 1) return bestTau;
 
-  // --- Harmonic consistency check ---
-  if (!isHarmonicallyConsistent(cmnd, bestLag, MIN_LAG, maxTau)) {
-    const halfFreqLag = bestLag * 2;
-    if (halfFreqLag <= maxTau && halfFreqLag >= MIN_LAG) {
-      if (isHarmonicallyConsistent(cmnd, halfFreqLag, MIN_LAG, maxTau)) {
-        return sampleRate / halfFreqLag;
-      }
-    }
-    const thirdFreqLag = bestLag * 3;
-    if (thirdFreqLag <= maxTau && thirdFreqLag >= MIN_LAG) {
-      if (isHarmonicallyConsistent(cmnd, thirdFreqLag, MIN_LAG, maxTau)) {
-        return sampleRate / thirdFreqLag;
-      }
-    }
-  }
+  const x0 = cmnd[bestTau - 1];
+  const x1 = cmnd[bestTau];
+  const x2 = cmnd[bestTau + 1];
+  const denom = x0 - 2 * x1 + x2;
 
-  return frequency;
+  if (denom === 0) return bestTau;
+
+  const p = 0.5 * (x0 - x2) / denom;
+  return bestTau + Math.max(-0.5, Math.min(0.5, p));
 }
 
 /**
  * Check whether a candidate fundamental lag has consistent harmonic dips.
- * @param {Float32Array} cmnd
- * @param {number} fundLag - candidate fundamental lag (float)
- * @param {number} minLag
- * @param {number} maxLag
- * @returns {boolean}
  */
 function isHarmonicallyConsistent(cmnd, fundLag, minLag, maxLag) {
   const fundIdx = Math.round(fundLag);
   if (fundIdx < 1 || fundIdx >= cmnd.length) return false;
-  if (cmnd[fundIdx] > 0.3) return false; // fundamental dip must be significant
+  if (cmnd[fundIdx] > 0.3) return false;
 
-  // Check 2nd harmonic
   const h2Idx = Math.round(fundLag * 2);
   if (h2Idx < cmnd.length && h2Idx >= minLag) {
-    // The 2nd harmonic should also show a dip (not necessarily as deep)
     if (cmnd[h2Idx] > 0.5) return false;
   }
 
   return true;
 }
 
-// Keep the old name as an alias so existing tests still compile,
-// but the old autoCorrelate is still exported for backward compat.
+/**
+ * If the primary lag fails harmonic consistency, try 2× and 3× (half and
+ * third the frequency) as fallback candidates.
+ */
+function tryHarmonicFallback(cmnd, bestLag, sampleRate, minLag, maxTau) {
+  for (const multiplier of [2, 3]) {
+    const lag = bestLag * multiplier;
+    if (lag <= maxTau && lag >= minLag) {
+      if (isHarmonicallyConsistent(cmnd, lag, minLag, maxTau)) {
+        return sampleRate / lag;
+      }
+    }
+  }
+  return sampleRate / bestLag;
+}
+
+// ── Legacy autocorrelation ───────────────────────────────────────────────────
 
 /**
- * Autocorrelation-based pitch detection (legacy, kept for backward compatibility).
- * @param {Float32Array|number[]} buffer - Audio samples in [-1, 1]
- * @param {number} sampleRate - Samples per second
- * @returns {number} Detected frequency in Hz, or -1 if no signal
+ * Autocorrelation-based pitch detection (legacy, kept for backward compat).
  */
 export function autoCorrelate(buffer, sampleRate) {
   const SIZE = buffer.length;
   const MAX_SAMPLES = Math.floor(SIZE / 2);
-  let best_offset = -1;
-  let best_correlation = 0;
-  let rms = 0;
 
-  for (let i = 0; i < SIZE; i++) {
-    const val = buffer[i];
-    rms += val * val;
-  }
-  rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.01) return -1;
+  if (computeRms(buffer) < RMS_GATE_AC) return -1;
 
   let lastCorrelation = 1;
   for (let offset = 1; offset < MAX_SAMPLES; offset++) {
-    let correlation = 0;
-    for (let i = 0; i < MAX_SAMPLES; i++) {
-      correlation += Math.abs(buffer[i] - buffer[i + offset]);
-    }
-    correlation = 1 - (correlation / MAX_SAMPLES);
+    const correlation = computeCorrelationAt(buffer, offset, MAX_SAMPLES);
 
-    if (correlation > 0.9) {
-      if (lastCorrelation < 0.9) {
-        let peak_offset = offset;
-        let peak_correlation = correlation;
-        for (let j = offset; j < Math.min(offset + 10, MAX_SAMPLES); j++) {
-          let test_correlation = 0;
-          for (let i = 0; i < MAX_SAMPLES; i++) {
-            test_correlation += Math.abs(buffer[i] - buffer[i + j]);
-          }
-          test_correlation = 1 - (test_correlation / MAX_SAMPLES);
-          if (test_correlation > peak_correlation) {
-            peak_correlation = test_correlation;
-            peak_offset = j;
-          }
-        }
-        best_offset = peak_offset;
-        best_correlation = peak_correlation;
-        break;
-      }
+    if (correlation > 0.9 && lastCorrelation < 0.9) {
+      const { offset: bestOffset, correlation: bestCorr } =
+        refineCorrelationPeak(buffer, offset, MAX_SAMPLES);
+
+      if (bestCorr > 0.9) return sampleRate / bestOffset;
     }
+
     lastCorrelation = correlation;
   }
 
-  if (best_offset !== -1 && best_correlation > 0.9) {
-    return sampleRate / best_offset;
-  }
   return -1;
+}
+
+/**
+ * Correlation at a single offset: 1 − mean(|buffer[i] − buffer[i+offset]|).
+ */
+function computeCorrelationAt(buffer, offset, maxSamples) {
+  let correlation = 0;
+  for (let i = 0; i < maxSamples; i++) {
+    correlation += Math.abs(buffer[i] - buffer[i + offset]);
+  }
+  return 1 - (correlation / maxSamples);
+}
+
+/**
+ * Scan up to 10 offsets from the initial peak to find the true maximum.
+ */
+function refineCorrelationPeak(buffer, offset, maxSamples) {
+  let peakOffset = offset;
+  let peakCorr = computeCorrelationAt(buffer, offset, maxSamples);
+
+  for (let j = offset; j < Math.min(offset + 10, maxSamples); j++) {
+    const testCorr = computeCorrelationAt(buffer, j, maxSamples);
+    if (testCorr > peakCorr) {
+      peakCorr = testCorr;
+      peakOffset = j;
+    }
+  }
+
+  return { offset: peakOffset, correlation: peakCorr };
 }
 
 // ── Note mapping ─────────────────────────────────────────────────────────────
 
 /**
  * Convert a frequency (Hz) to the nearest note name, octave, and cents offset.
- * @param {number} frequency - Frequency in Hz
- * @returns {{ note: string, octave: number, cents: number, frequency: number }}
  */
 export function frequencyToNote(frequency) {
   if (frequency <= 0 || !Number.isFinite(frequency)) {
@@ -236,9 +252,9 @@ export function frequencyToNote(frequency) {
 
   return {
     note: NOTE_STRINGS[noteIndex < 0 ? noteIndex + 12 : noteIndex],
-    octave: octave,
-    cents: cents,
-    frequency: frequency,
+    octave,
+    cents,
+    frequency,
   };
 }
 
@@ -246,107 +262,86 @@ export function frequencyToNote(frequency) {
 
 /**
  * Smooths raw frequency readings so the display doesn't jump around.
- *
- * Strategy:
- *  - Keep a ring buffer of the last N raw detections.
- *  - Compute the weighted median (recent readings count more).
- *  - Only emit a new "stable" note when the median note has been the
- *    same for at least `minAgree` consecutive samples.
- *  - If the note changes, require confirmation before switching.
  */
 export class PitchSmoothing {
-  /**
-   * @param {number} windowSize - Number of raw samples to keep (default 8)
-   * @param {number} minAgree   - Consecutive same-note samples required to switch (default 3)
-   */
   constructor(windowSize = 8, minAgree = 3) {
     this.windowSize = windowSize;
     this.minAgree = minAgree;
-    this.history = [];          // { freq, note, octave, cents }
-    this.currentNote = null;    // { note, octave }
+    this.history = [];
+    this.currentNote = null;
     this.currentFreq = -1;
     this.currentCents = 0;
     this.agreeCount = 0;
   }
 
-  /**
-   * Feed a new raw frequency detection.
-   * @param {number} rawFreq - Detected frequency in Hz, or -1 for silence
-   * @returns {{ note: string, octave: number, cents: number, frequency: number, stable: boolean } | null}
-   */
   update(rawFreq) {
-    if (rawFreq <= 0) {
-      // Silence — reset
-      this.currentNote = null;
-      this.currentFreq = -1;
-      this.currentCents = 0;
-      this.agreeCount = 0;
-      this.history = [];
-      return null;
-    }
+    if (rawFreq <= 0) return this._handleSilence();
 
-    const noteInfo = frequencyToNote(rawFreq);
-    this.history.push(noteInfo);
-    if (this.history.length > this.windowSize) {
-      this.history.shift();
-    }
+    this.history.push(frequencyToNote(rawFreq));
+    if (this.history.length > this.windowSize) this.history.shift();
 
-    // Compute median frequency from the window (weighted toward recent)
     const medianFreq = this._weightedMedian();
     const medianNote = frequencyToNote(medianFreq);
+    this._updateAgreement(medianNote);
+
+    return this._buildResult();
+  }
+
+  _handleSilence() {
+    this.currentNote = null;
+    this.currentFreq = -1;
+    this.currentCents = 0;
+    this.agreeCount = 0;
+    this.history = [];
+    return null;
+  }
+
+  _updateAgreement(medianNote) {
     const noteKey = `${medianNote.note}${medianNote.octave}`;
     const currentKey = this.currentNote
       ? `${this.currentNote.note}${this.currentNote.octave}`
       : null;
 
     if (noteKey === currentKey) {
-      // Same note — confirm
       this.agreeCount++;
-      this.currentFreq = medianFreq;
-      this.currentCents = medianNote.cents;
     } else {
-      // Different note — need confirmation
       this.agreeCount = 1;
-      // Tentatively update so we start counting agreement
       this.currentNote = { note: medianNote.note, octave: medianNote.octave };
-      this.currentFreq = medianFreq;
-      this.currentCents = medianNote.cents;
     }
 
-    const stable = this.agreeCount >= this.minAgree;
+    this.currentFreq = medianNote.frequency;
+    this.currentCents = medianNote.cents;
+  }
 
+  _buildResult() {
     return {
       note: this.currentNote.note,
       octave: this.currentNote.octave,
       cents: this.currentCents,
       frequency: this.currentFreq,
-      stable,
+      stable: this.agreeCount >= this.minAgree,
     };
   }
 
-  /**
-   * Weighted median: sort by frequency, give more weight to recent entries.
-   */
   _weightedMedian() {
     if (this.history.length === 0) return -1;
 
-    // Sort copies by frequency
-    const sorted = this.history.slice().sort((a, b) => a.frequency - b.frequency);
+    const sorted = this.history.slice()
+      .sort((a, b) => a.frequency - b.frequency);
 
-    // Assign weights: position in history (more recent = higher weight)
-    const totalWeight = this.history.length * (this.history.length + 1) / 2;
+    const totalWeight =
+      this.history.length * (this.history.length + 1) / 2;
     let cumWeight = 0;
     const halfWeight = totalWeight / 2;
 
     for (let i = 0; i < sorted.length; i++) {
-      // Find the original index of this entry to get its recency weight
       const origIdx = this.history.indexOf(sorted[i]);
-      const weight = origIdx + 1; // 1-based: most recent = highest
-      cumWeight += weight;
+      cumWeight += origIdx + 1;
       if (cumWeight >= halfWeight) {
         return sorted[i].frequency;
       }
     }
+
     return sorted[sorted.length - 1].frequency;
   }
 
@@ -361,9 +356,6 @@ export class PitchSmoothing {
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
 
-/**
- * Build a synthetic sine-wave buffer for testing.
- */
 export function generateSineBuffer(frequency, sampleRate, length) {
   const buffer = new Float32Array(length);
   for (let i = 0; i < length; i++) {
@@ -372,9 +364,6 @@ export function generateSineBuffer(frequency, sampleRate, length) {
   return buffer;
 }
 
-/**
- * Build a silent buffer for testing.
- */
 export function generateSilentBuffer(length) {
   return new Float32Array(length);
 }
