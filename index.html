@@ -73,7 +73,7 @@
             background: linear-gradient(to top, #ff4444, #ff6666);
             transform-origin: bottom center;
             transform: translateX(-50%) rotate(0deg);
-            transition: transform 0.1s ease-out;
+            transition: transform 0.15s ease-out;
             border-radius: 2px;
             box-shadow: 0 0 10px rgba(255, 68, 68, 0.5);
         }
@@ -133,9 +133,25 @@
         .current-note {
             font-size: 48px;
             font-weight: bold;
+            color: #888;
+            text-shadow: none;
+            margin-bottom: 10px;
+            transition: color 0.2s ease, text-shadow 0.2s ease;
+        }
+
+        .current-note.in-tune {
             color: #4CAF50;
             text-shadow: 0 0 20px rgba(76, 175, 80, 0.5);
-            margin-bottom: 10px;
+        }
+
+        .current-note.close {
+            color: #FFC107;
+            text-shadow: 0 0 20px rgba(255, 193, 7, 0.4);
+        }
+
+        .current-note.off {
+            color: #ff5252;
+            text-shadow: 0 0 15px rgba(255, 82, 82, 0.3);
         }
 
         .frequency {
@@ -147,18 +163,19 @@
             font-size: 16px;
             color: #fff;
             margin-top: 5px;
-        }
-
-        .cents-display.sharp {
-            color: #ff9800;
-        }
-
-        .cents-display.flat {
-            color: #2196F3;
+            transition: color 0.2s ease;
         }
 
         .cents-display.intune {
             color: #4CAF50;
+        }
+
+        .cents-display.close {
+            color: #FFC107;
+        }
+
+        .cents-display.off {
+            color: #ff5252;
         }
 
         .controls {
@@ -221,10 +238,9 @@
         </div>
     </div>
 
-    <script>
-        // Note frequencies (A4 = 440 Hz standard tuning)
-        const noteStrings = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-        
+    <script type="module">
+        import { detectPitch, frequencyToNote, PitchSmoothing } from './src/tuner.js';
+
         let audioContext;
         let analyser;
         let microphone;
@@ -238,133 +254,64 @@
         const needle = document.getElementById('needle');
         const status = document.getElementById('status');
 
+        // Smoothing: 8-sample window, need 3 consecutive agreements to switch notes
+        const pitchSmoother = new PitchSmoothing(8, 3);
+
         // Create scale marks
         const scaleMarks = document.getElementById('scaleMarks');
         for (let i = -50; i <= 50; i += 10) {
             const mark = document.createElement('div');
             mark.className = i === 0 ? 'scale-mark major' : 'scale-mark';
             mark.style.transform = `translateX(-50%) rotate(${i * 0.9}deg)`;
-            
+
             if (i % 20 === 0) {
                 const label = document.createElement('div');
                 label.className = 'scale-label';
                 label.textContent = i > 0 ? `+${i}` : i;
                 mark.appendChild(label);
             }
-            
+
             scaleMarks.appendChild(mark);
         }
 
-        // Autocorrelation algorithm for pitch detection
-        function autoCorrelate(buffer, sampleRate) {
-            const SIZE = buffer.length;
-            const MAX_SAMPLES = Math.floor(SIZE / 2);
-            let best_offset = -1;
-            let best_correlation = 0;
-            let rms = 0;
-
-            // Calculate RMS (root mean square) to detect if there's enough signal
-            for (let i = 0; i < SIZE; i++) {
-                const val = buffer[i];
-                rms += val * val;
-            }
-            rms = Math.sqrt(rms / SIZE);
-            
-            // Not enough signal
-            if (rms < 0.01) return -1;
-
-            // Find the best correlation - looking for the smallest offset (highest frequency)
-            // Otherwise things like D4 will rather show up as G2, which is obviously not what we want
-            let lastCorrelation = 1;
-            for (let offset = 1; offset < MAX_SAMPLES; offset++) {
-                let correlation = 0;
-
-                for (let i = 0; i < MAX_SAMPLES; i++) {
-                    correlation += Math.abs(buffer[i] - buffer[i + offset]);
-                }
-
-                correlation = 1 - (correlation / MAX_SAMPLES);
-                
-                // Look for first strong correlation peak after a dip
-                if (correlation > 0.9) {
-                    if (lastCorrelation < 0.9) {
-                        // Found rising edge of correlation peak
-                        // Refine around this offset to find the true peak
-                        let peak_offset = offset;
-                        let peak_correlation = correlation;
-                        
-                        for (let j = offset; j < Math.min(offset + 10, MAX_SAMPLES); j++) {
-                            let test_correlation = 0;
-                            for (let i = 0; i < MAX_SAMPLES; i++) {
-                                test_correlation += Math.abs(buffer[i] - buffer[i + j]);
-                            }
-                            test_correlation = 1 - (test_correlation / MAX_SAMPLES);
-                            
-                            if (test_correlation > peak_correlation) {
-                                peak_correlation = test_correlation;
-                                peak_offset = j;
-                            }
-                        }
-                        
-                        best_offset = peak_offset;
-                        best_correlation = peak_correlation;
-                        break; // Take the first (highest frequency) strong correlation
-                    }
-                }
-                
-                lastCorrelation = correlation;
-            }
-
-            if (best_offset !== -1 && best_correlation > 0.9) {
-                return sampleRate / best_offset;
-            }
-            return -1;
-        }
-
-        // Convert frequency to note name and cents offset
-        function frequencyToNote(frequency) {
-            const noteNum = 12 * (Math.log(frequency / 440) / Math.log(2));
-            const roundedNoteNum = Math.round(noteNum);
-            const cents = Math.floor((noteNum - roundedNoteNum) * 100);
-            const noteIndex = (roundedNoteNum + 69) % 12;
-            const octave = Math.floor((roundedNoteNum + 69) / 12);
-            
-            return {
-                note: noteStrings[noteIndex < 0 ? noteIndex + 12 : noteIndex],
-                octave: octave,
-                cents: cents,
-                frequency: frequency
-            };
+        /**
+         * Classify cents offset into a visual tier.
+         *  ±0 .. ±5   → "in-tune"  (green)
+         *  ±5 .. ±15  → "close"    (yellow)
+         *  > ±15      → "off"      (red)
+         */
+        function tuneTier(cents) {
+            const abs = Math.abs(cents);
+            if (abs <= 5) return 'intune';
+            if (abs <= 15) return 'close';
+            return 'off';
         }
 
         // Update the display
-        function updateDisplay(frequency) {
-            if (frequency === -1) {
+        function updateDisplay(result) {
+            if (!result) {
                 noteDisplay.textContent = '--';
+                noteDisplay.className = 'current-note';
                 frequencyDisplay.textContent = '--- Hz';
                 centsDisplay.textContent = '-- cents';
+                centsDisplay.className = 'cents-display';
                 needle.style.transform = 'translateX(-50%) rotate(0deg)';
                 return;
             }
 
-            const noteInfo = frequencyToNote(frequency);
-            noteDisplay.textContent = `${noteInfo.note}${noteInfo.octave}`;
-            frequencyDisplay.textContent = `${frequency.toFixed(1)} Hz`;
-            
-            const cents = noteInfo.cents;
+            noteDisplay.textContent = `${result.note}${result.octave}`;
+            frequencyDisplay.textContent = `${result.frequency.toFixed(1)} Hz`;
+
+            const cents = result.cents;
             const centsText = cents > 0 ? `+${cents}` : cents;
             centsDisplay.textContent = `${centsText} cents`;
-            
-            // Update cents display color
-            centsDisplay.className = 'cents-display';
-            if (Math.abs(cents) < 5) {
-                centsDisplay.classList.add('intune');
-            } else if (cents > 0) {
-                centsDisplay.classList.add('sharp');
-            } else {
-                centsDisplay.classList.add('flat');
-            }
-            
+
+            const tier = tuneTier(cents);
+
+            // Apply colour tier to both note label and cents readout
+            noteDisplay.className = `current-note ${tier}`;
+            centsDisplay.className = `cents-display ${tier}`;
+
             // Rotate needle (-45 to +45 degrees based on cents)
             const needleRotation = Math.max(-45, Math.min(45, cents * 0.9));
             needle.style.transform = `translateX(-50%) rotate(${needleRotation}deg)`;
@@ -374,8 +321,9 @@
         function processAudio() {
             const buffer = new Float32Array(analyser.fftSize);
             analyser.getFloatTimeDomainData(buffer);
-            const frequency = autoCorrelate(buffer, audioContext.sampleRate);
-            updateDisplay(frequency);
+            const rawFreq = detectPitch(buffer, audioContext.sampleRate);
+            const smoothed = pitchSmoother.update(rawFreq);
+            updateDisplay(smoothed);
         }
 
         // Start/Stop tuner
@@ -395,6 +343,7 @@
                     scriptProcessor.connect(audioContext.destination);
                     scriptProcessor.onaudioprocess = processAudio;
 
+                    pitchSmoother.reset();
                     isActive = true;
                     startButton.textContent = 'Stop Tuner';
                     startButton.classList.add('active');
@@ -419,11 +368,12 @@
                     audioContext.close();
                 }
 
+                pitchSmoother.reset();
                 isActive = false;
                 startButton.textContent = 'Start Tuner';
                 startButton.classList.remove('active');
                 status.textContent = 'Stopped';
-                updateDisplay(-1);
+                updateDisplay(null);
             }
         }
 
