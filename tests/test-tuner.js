@@ -458,6 +458,25 @@ describe('PitchSmoothing', () => {
     const r = s.update(440);
     assertFalse(r.stable, 'after reset, first reading should not be stable');
   });
+
+  it('handles single-element history correctly', () => {
+    const s = new PitchSmoothing(8, 3);
+    const r = s.update(440);
+    assertTrue(r, 'should return a result');
+    assertEqual(r.note, 'A');
+    assertEqual(r.octave, 4);
+    assertFalse(r.stable, 'single reading should not be stable with minAgree=3');
+  });
+
+  it('handles equal-frequency readings', () => {
+    const s = new PitchSmoothing(4, 2);
+    for (let i = 0; i < 6; i++) s.update(392); // G4
+    const r = s.update(392);
+    assertTrue(r.stable, 'should be stable on repeated identical readings');
+    assertEqual(r.note, 'G');
+    assertEqual(r.octave, 4);
+    assertClose(r.cents, 0, 2);
+  });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -555,6 +574,54 @@ describe('Integration: detectPitch → frequencyToNote', () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Integration: fallback and robustness paths
+// ──────────────────────────────────────────────────────────────────────────────
+
+describe('Integration: fallback and robustness paths', () => {
+  const sampleRate = 44100;
+  const bufLen = 4096;
+
+  it('strong 2nd harmonic (weak fundamental) detects a valid pitch', () => {
+    // Fundamental 440 Hz at 0.15 amplitude, 2nd harmonic 880 Hz at 0.9 amplitude.
+    // The detector may lock onto either 440 Hz or 880 Hz depending on CMND shape.
+    // Either way it should return a valid frequency (not -1) within a reasonable range.
+    const buf = new Float32Array(bufLen);
+    for (let i = 0; i < bufLen; i++) {
+      buf[i] = 0.15 * Math.sin(2 * Math.PI * 440 * i / sampleRate)
+             + 0.90 * Math.sin(2 * Math.PI * 880 * i / sampleRate);
+    }
+    const freq = detectPitch(buf, sampleRate);
+    assertGreaterThan(freq, 0, 'should detect a frequency');
+    assertTrue(
+      (freq > 400 && freq < 500) || (freq > 800 && freq < 950),
+      `should be near 440 Hz or 880 Hz, got ${freq.toFixed(1)} Hz`
+    );
+  });
+
+  it('inharmonic two-tone signal does not crash and returns a frequency', () => {
+    // 440 Hz + 500 Hz — no harmonic relationship.
+    // The detector should still return something reasonable without error.
+    const buf = new Float32Array(bufLen);
+    for (let i = 0; i < bufLen; i++) {
+      buf[i] = 0.5 * Math.sin(2 * Math.PI * 440 * i / sampleRate)
+             + 0.5 * Math.sin(2 * Math.PI * 500 * i / sampleRate);
+    }
+    const freq = detectPitch(buf, sampleRate);
+    assertGreaterThan(freq, 0, 'should detect a frequency');
+    assertLessThan(freq, 1000, 'frequency should be below 1000 Hz');
+  });
+
+  it('very low frequency near MIN_FREQ boundary', () => {
+    // 32 Hz is just above MIN_FREQ (30 Hz) — needs a large buffer.
+    const bufLen = 32768;
+    const buf = generateSineBuffer(32, sampleRate, bufLen);
+    const freq = detectPitch(buf, sampleRate);
+    assertGreaterThan(freq, 0, 'should detect a frequency near MIN_FREQ');
+    assertClose(freq, 32, 3, 'expected ~32 Hz');
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Legacy autoCorrelate (backward compatibility)
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -571,6 +638,33 @@ describe('autoCorrelate (legacy)', () => {
 
   it('returns -1 for silence', () => {
     const buf = generateSilentBuffer(bufLen);
+    assertEqual(autoCorrelate(buf, sampleRate), -1);
+  });
+
+  it('detects 261.63 Hz (C4)', () => {
+    const buf = generateSineBuffer(261.63, sampleRate, bufLen);
+    const freq = autoCorrelate(buf, sampleRate);
+    assertGreaterThan(freq, 0);
+    assertClose(freq, 261.63, 3);
+  });
+
+  it('detects 392 Hz (G4)', () => {
+    const buf = generateSineBuffer(392, sampleRate, bufLen);
+    const freq = autoCorrelate(buf, sampleRate);
+    assertGreaterThan(freq, 0);
+    assertClose(freq, 392, 3);
+  });
+
+  it('detects 659.25 Hz (E5)', () => {
+    const buf = generateSineBuffer(659.25, sampleRate, bufLen);
+    const freq = autoCorrelate(buf, sampleRate);
+    assertGreaterThan(freq, 0);
+    assertClose(freq, 659.25, 3);
+  });
+
+  it('returns -1 for very low-amplitude signal', () => {
+    const buf = generateSineBuffer(440, sampleRate, bufLen);
+    for (let i = 0; i < buf.length; i++) buf[i] *= 0.005;
     assertEqual(autoCorrelate(buf, sampleRate), -1);
   });
 });

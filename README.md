@@ -25,4 +25,4 @@ node --input-type=module -e "import './tests/test-bass-recognition.js'"
 - **test-audio-recognition.js** — Pitch detection against pure-tone WAV recordings
 - **test-bass-recognition.js** — Pitch detection against real bass-guitar WAV recordings
 
-All 125 tests should pass.
+All 134 tests should pass.
