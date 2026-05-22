@@ -25,9 +25,12 @@ import {
   detectPitch,
   frequencyToNote,
   PitchSmoothing,
+} from '../src/tuner.js';
+
+import {
   generateSineBuffer,
   generateSilentBuffer,
-} from '../src/tuner.js';
+} from './test-helpers.js';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // NOTE_STRINGS

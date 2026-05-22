@@ -354,16 +354,4 @@ export class PitchSmoothing {
   }
 }
 
-// ── Test helpers ─────────────────────────────────────────────────────────────
 
-export function generateSineBuffer(frequency, sampleRate, length) {
-  const buffer = new Float32Array(length);
-  for (let i = 0; i < length; i++) {
-    buffer[i] = Math.sin(2 * Math.PI * frequency * i / sampleRate);
-  }
-  return buffer;
-}
-
-export function generateSilentBuffer(length) {
-  return new Float32Array(length);
-}
